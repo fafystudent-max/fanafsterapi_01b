@@ -1,0 +1,7 @@
+# Hamma 5 Render uchun bir xil
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.5
+# notebooklm-py: eski main.py ishlayotgan Renderdagi requirements.txt'dagi qatorni AYNAN shunday qoldiring
+# (versiya va "android" backend shunga bog'liq). 0.8.3 bilan ishlangan.
+notebooklm-py==0.8.3
