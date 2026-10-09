@@ -6,7 +6,8 @@ Ishga tushirish: python3.12 -m uvicorn main1:app --host 0.0.0.0 --port $PORT
 Endpoint'lar:
     POST /api/create   {"title"}                 -> {"notebook_id"}            (sinxron)
     POST /api/delete   {"notebook_id"}           -> {"deleted"}                (xato bo'lganda tozalash)
-Render env: FANFASTER_API_KEY, NLM_ACCOUNTS_JSON, NLM_MASTER_<PROFIL>_B64, PROTECTED_NOTEBOOK_IDS, MIN_GAP_SEC=1
+Render env: FANFASTER_API_KEY, NLM_ACCOUNTS_JSON, NLM_MASTER_<PROFIL>_B64, PROTECTED_NOTEBOOK_IDS, MIN_GAP_SEC=1,
+            NLM_LIGHT_BACKEND (ixtiyoriy), NLM_NB_LIB=1 (standart; 0 -> eski CLI)
 """
 import asyncio
 import base64
@@ -57,6 +58,10 @@ AUTH_REFRESH_HOURS = float(os.environ.get("NLM_AUTH_REFRESH_HOURS", "6"))  # 0 =
 # `ask` bunga kirmaydi (u HEAVY_ASK_SEM bilan alohida cheklanadi).
 CLI_LIMIT = max(int(os.environ.get("CLI_LIMIT", "2")), 1)
 CLI_SEM = threading.BoundedSemaphore(CLI_LIMIT)
+# Hamma jarayon (create/source/history/delete) STANDART holda android backend orqali ishlaydi (RAM kam).
+# NLM_LIGHT_BACKEND=web (yoki none) -> odatdagi backendga qaytarish. `ask` alohida: NLM_CUSTOM_ASK_BACKEND (3-bosqich).
+_lb = os.environ.get("NLM_LIGHT_BACKEND", "android").strip().lower()
+LIGHT_BACKEND = "" if _lb in ("", "web", "none") else _lb
 
 NLM = shutil.which("notebooklm") or "notebooklm"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -154,6 +159,8 @@ def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = Non
             time.sleep(wait)
         LAST_CALL[0] = time.time()
     sem = None if heavy else CLI_SEM
+    if backend is None and not heavy and LIGHT_BACKEND:
+        backend = LIGHT_BACKEND
     if sem:
         sem.acquire()
     try:
@@ -368,11 +375,62 @@ def health_check():
             "ready": READY["session"], "mem_mb": mem_mb()}
 
 
+# ───────────────────────── KUTUBXONA ORQALI DAFTAR YARATISH/O'CHIRISH (jarayon ichida, CLI'siz) ─────────────────────────
+# NLM_NB_LIB=0 -> eski CLI yo'li. Android'da `create` bo'lmasa, o'sha jarayon ichida web backend sinaladi, keyin CLI.
+NB_LIB = os.environ.get("NLM_NB_LIB", "1").strip() != "0"
+
+
+class LibUnavailable(Exception):
+    """Kutubxona yo'li ishlamadi va hech narsa o'zgarmagan -> eski CLI yo'liga o'tish xavfsiz."""
+
+
+def _nb_exc(e: Exception) -> Exception:
+    return AuthError(str(e)[:500]) if any(w in str(e).lower() for w in AUTH_WORDS) else NlmError(str(e)[:500])
+
+
+async def _lib_nb(op: str, arg: str, backend: Optional[str]):
+    from notebooklm import NotebookLMClient
+    kw = {"profile": P}
+    if backend:
+        kw["backend"] = backend
+    async with await NotebookLMClient.from_storage(**kw) as client:
+        if op == "create":
+            nb = await client.notebooks.create(arg)
+            return getattr(nb, "id", None)
+        await client.notebooks.delete(arg)
+        return True
+
+
+def lib_nb(op: str, arg: str):
+    backends = [LIGHT_BACKEND or None] + ([None] if LIGHT_BACKEND else [])
+    last: Optional[Exception] = None
+    for be in backends:
+        try:
+            return asyncio.run(_lib_nb(op, arg, be))
+        except (ImportError, AttributeError, NotImplementedError, TypeError) as e:   # qo'llab-quvvatlanmaydi: keyingi backend
+            last = e
+            print(f"[nb-lib] {op} backend={be or 'web'} ishlamadi: {str(e)[:120]}", flush=True)
+            continue
+        except Exception as e:  # noqa: BLE001
+            raise _nb_exc(e)
+    raise LibUnavailable(str(last))
+
+
 # ───────────────────────── DAFTARNI O'CHIRISH ─────────────────────────
 def delete_notebook(profile: str, nid: str) -> bool:
     """Faqat vaqtinchalik daftarni o'chiradi. Katalog va umumiy daftarlarga hech qachon tegmaydi."""
     if not nid or nid in PROTECTED_IDS:
         return False
+    if NB_LIB:
+        try:
+            lib_nb("delete", nid)
+            return True
+        except LibUnavailable:
+            pass
+        except Exception as e:  # noqa: BLE001
+            if "not found" in str(e).lower():       # allaqachon o'chirilgan
+                return True
+            print(f"[delete] kutubxona xato berdi, CLI'ga o'tildi: {str(e)[:120]}", flush=True)
     for args in (("delete", "--notebook", nid, "--yes"), ("delete", "--notebook", nid), ("delete", nid)):
         try:
             nlm(profile, *args, timeout=60, stdin="y\n")
@@ -397,11 +455,21 @@ class CreateReq(BaseModel):
 @app.post("/api/create", dependencies=[Depends(require_key)])
 def create_notebook(req: CreateReq):
     """Vaqtinchalik daftar ochadi va ID'sini qaytaradi (qolgan bosqichlar shu ID bilan ishlaydi)."""
-    try:
-        out = with_retry(lambda: nlm(P, "create", f"Kazus: {req.title}"[:80], timeout=120))
-    except Exception as e:  # noqa: BLE001
-        raise http_fail(e)
-    m = UUID_RE.search(out)
+    title = f"Kazus: {req.title}"[:80]
+    out = None
+    if NB_LIB:
+        try:
+            out = with_retry(lambda: lib_nb("create", title))
+        except LibUnavailable as e:
+            print(f"[s1] kutubxona yo'li ishlamadi, CLI'ga o'tildi: {str(e)[:120]}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            raise http_fail(e)
+    if out is None:
+        try:
+            out = with_retry(lambda: nlm(P, "create", title, timeout=120))
+        except Exception as e:  # noqa: BLE001
+            raise http_fail(e)
+    m = UUID_RE.search(str(out))
     if not m:
         print(f"[s1] daftar ID topilmadi: {out[:200]}", flush=True)
         raise HTTPException(502, {"code": "error", "message": "Daftar ochilmadi. Qayta urinib ko'ring."})
